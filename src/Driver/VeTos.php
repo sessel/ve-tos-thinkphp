@@ -2,9 +2,10 @@
 
 namespace Sessel\VeTosThinkphp\Driver;
 
+use DateTime;
 use InvalidArgumentException;
 use League\Flysystem\Filesystem;
-use League\Flysystem\AdapterInterface;
+use League\Flysystem\FilesystemAdapter;
 use League\Flysystem\Config;
 use think\filesystem\Driver;
 use Sessel\VeTosThinkphp\Adapter\VeTosAdapter;
@@ -42,7 +43,7 @@ class VeTos extends Driver
      * 创建文件系统
      * @return Filesystem
      */
-    protected function createFilesystem(AdapterInterface $adapter): Filesystem
+    protected function createFilesystem(FilesystemAdapter $adapter): Filesystem
     {
         // 返回Filesystem实例
         return new Filesystem($adapter, $this->config);
@@ -50,9 +51,9 @@ class VeTos extends Driver
 
     /**
      * 创建文件系统
-     * @return AdapterInterface
+     * @return FilesystemAdapter
      */
-    protected function createAdapter(): AdapterInterface
+    protected function createAdapter(): FilesystemAdapter
     {
         // 合并默认配置
         $adapter = new VeTosAdapter($this->config);
@@ -101,16 +102,25 @@ class VeTos extends Driver
         if ( ! is_resource($resource) || get_resource_type($resource) !== 'stream') {
             throw new InvalidArgumentException(__METHOD__ . ' expects argument #2 to be a valid resource.');
         }
-        $config = $config = new Config($config);
-        if ($this->filesystem->getAdapter()->has($path)) {
-            return $this->filesystem->getAdapter()->updateStream($path, $resource, $config);
+        if ($this->filesystem->has($path)) {
+            return $this->filesystem->writeStream($path, $resource, $config);
         }
 
-        return $this->filesystem->getAdapter()->writeStream($path, $resource, $config);
+        return $this->filesystem->writeStream($path, $resource, $config);
+    }
+
+
+    public function url(string $path, int $expires = 0, $config = []): string
+    {
+        if($expires > 0){
+            $datetime = sprintf('+%d seconds');
+            return $this->filesystem->temporaryUrl($path, new DateTime($datetime), $config);
+        }
+        return $this->filesystem->publicUrl($path);
     }
 
     public function __call($method, $parameters)
     {
-        return $this->filesystem->getAdapter()->$method(...$parameters);
+        return $this->filesystem->$method(...$parameters);
     }
 }

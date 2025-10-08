@@ -4,12 +4,12 @@
     "type": "library",
     "license": "MIT",
      "require": {
-        "php": ">=7.4",
+        "php": ">=8.0",
         "volcengine/ve-tos-php-sdk": "^2.1",
-        "topthink/think-filesystem": "^2.0"
+        "topthink/think-filesystem": "^3.0"
     },
     "require-dev": {
-        "phpunit/phpunit": "~6.0"
+        "phpunit/phpunit": "~9.0"
     },
     "autoload": {
         "psr-4": {
