@@ -1,19 +1,18 @@
 <?php
 
+/**
+ * @author     wangtao <wangtao861024@gmail.com>
+ * @license    MIT License
+ */
+
+declare(strict_types=1);
+
 namespace Sessel\VeTosThinkphp\Adapter;
 
 use DateTimeInterface;
 use League\Flysystem\FilesystemAdapter;
 use League\Flysystem\Config;
 use League\Flysystem\DirectoryAttributes;
-use League\Flysystem\Util;
-use Tos\Exception\TosClientException;
-use Tos\Exception\TosServerException;
-use Tos\Model\ListObjectsInput;
-use Tos\Model\HeadObjectInput;
-use Tos\Model\Object\ListObjectsV2Output;
-use Tos\Model\PreSignedURLInput;
-use Tos\TosClient;
 use League\Flysystem\Exception;
 use League\Flysystem\FileAttributes;
 use League\Flysystem\InvalidVisibilityProvided;
@@ -25,15 +24,30 @@ use League\Flysystem\UnableToDeleteFile;
 use League\Flysystem\UnableToMoveFile;
 use League\Flysystem\UnableToReadFile;
 use League\Flysystem\UnableToRetrieveMetadata;
+use League\Flysystem\UnableToWriteFile;
 use League\Flysystem\UrlGeneration\PublicUrlGenerator;
 use League\Flysystem\Visibility;
-use Sessel\VeTosThinkphp\VeTosFilesystemException;
+use Tos\TosClient;
+use Tos\Exception\TosClientException;
+use Tos\Exception\TosServerException;
 use Tos\Model\CopyObjectInput;
+use Tos\Model\DeleteMultiObjectsInput;
 use Tos\Model\DeleteObjectInput;
 use Tos\Model\Enum;
 use Tos\Model\GetObjectInput;
 use Tos\Model\PutObjectACLInput;
 use Tos\Model\PutObjectInput;
+use Tos\Model\ListObjectsInput;
+use Tos\Model\HeadObjectInput;
+use Tos\Model\Object\ListObjectsV2Output;
+use Tos\Model\PreSignedURLInput;
+use Sessel\VeTosThinkphp\VeTosFilesystemException;
+use Tos\Model\AppendObjectInput;
+use Tos\Model\CompleteMultipartUploadInput;
+use Tos\Model\CreateMultipartUploadInput;
+use Tos\Model\GetObjectACLInput;
+use Tos\Model\UploadedPart;
+use Tos\Model\UploadPartInput;
 
 class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
 {
@@ -58,6 +72,18 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     protected $domain;
 
     /**
+     * 追加写入的最小长度128KB
+     * @var int
+     */
+    const MIN_APPEND_SIZE = 131072;
+
+    /**
+     * 分片上传的大小5M(5 * 1024 * 1024)
+     * @var int
+     */
+    const DEFAULT_PART_SIZE = 5242880;
+
+    /**
      * 配置参数
      * @var array
      */
@@ -69,7 +95,7 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
         $this->bucket = $this->config['bucket'];
         $this->prefix = $this->config['prefix'] ?? '';
         $this->domain = $this->config['domain'] ?? '';
-        
+
         // 初始化TOS客户端
         $this->client = new TosClient([
             'ak' => $this->config['ak'],
@@ -80,6 +106,16 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
             'maxRetries' => $this->config['max_retries'] ?? 3,
             'endpoint' => $this->config['endpoint'] ?? '',
         ]);
+    }
+
+    /**
+     * 处理TOS异常
+     */
+    protected function handleException(\Exception $e, string $path = ''): void
+    {
+        if(!empty($this->config['error_handler']) && is_callable($this->config['error_handler'])){
+            call_user_func($this->config['error_handler'], $e, $path);
+        }
     }
 
     /**
@@ -118,7 +154,10 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     }
 
     /**
-     * {@inheritdoc}
+     * 文件是否存在
+     * @param string path
+     * @return bool
+     * @throws UnableToCheckExistence
      */
     public function fileExists(string $path): bool
     {
@@ -130,28 +169,192 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
             if ($e->getStatusCode() === 404) {
                 return false;
             }
+            $this->handleException($e, $path);
             throw UnableToCheckExistence::forLocation($path, $e);
         } catch (\Exception $e) {
+            $this->handleException($e, $path);
             throw UnableToCheckExistence::forLocation($path, $e);
         }
     }
 
     /**
-     * {@inheritdoc}
+     * 目录是否存在
+     * @param string path
+     * @return bool
+     * @throws UnableToCheckExistence
      */
     public function directoryExists(string $path): bool
     {
         $prefix = rtrim($this->applyPathPrefix($path), '/') . '/';
-        
+
         try {
             $listInput = new ListObjectsInput($this->bucket);
             $listInput->setPrefix($prefix);
             $listInput->setMaxKeys(1);
-            
+
             $output = $this->client->listObjects($listInput);
             return $output->getContents() !== [] || $output->getCommonPrefixes() !== [];
         } catch (\Exception $e) {
+            $this->handleException($e, $path);
             throw UnableToCheckExistence::forLocation($path, $e);
+        }
+    }
+
+    /**
+     * 上传文本
+     * @param string path
+     * @param string content
+     * @param Config config
+     * @return void
+     * @throws UnableToWriteFile
+     */
+    public function write(string $path, string $content, Config $config): void
+    {
+        try {
+            $key = $this->applyPathPrefix($path);
+            $input = new PutObjectInput($this->bucket, $key, $content);
+            // 设置对象 ACL
+            $input->setACL($config->get('acl', Enum::ACLPublicRead));
+            // 设置对象 StorageClass
+            $input->setStorageClass($config->get('storage_class', Enum::StorageClassStandard));
+            if(($meta = $config->get('meta')) && is_array($meta)){
+                // 设置对象自定义元数据
+                $input->setMeta($meta);
+            }
+            // 设置对象 Content-Type
+            $input->setContentType($config->get('content_type', 'text/plain'));
+            $this->client->putObject($input);
+        } catch (\Exception $e) {
+            $this->handleException($e, $path);
+            throw new UnableToWriteFile($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * 普通上传
+     * 追加后的对象大小不能大于 5GiB。
+     * 对于通过追加上传创建的对象，进行普通上传操作，对象被覆盖且对象类型会发生变化。
+     * 通过普通上传创建的对象不支持追加上传。
+     * 通过追加上传创建的对象不支持拷贝。
+     * 如果您的桶处于开启或者暂停多版本功能的状态下，或存储桶的类型为低频存储，则无法通过追加上传创建对象。
+     * @param string path
+     * @param string content
+     * @param Config config
+     * @return int
+     * @throws UnableToCheckExistence
+     */
+    public function appendWrite(string $path, string $content, Config $config): int
+    {
+        try {
+            //每次追加上传的数据大小不能小于 128 KB
+            if(strlen($content) < SELF::MIN_APPEND_SIZE){
+                throw new UnableToWriteFile('append too short');
+            }
+            $key = $this->applyPathPrefix($path);
+            if(!$this->fileExists($path)){
+                $nextAppendOffset = 0;
+            }else{
+                $input = new HeadObjectInput($this->bucket, $key);
+                $output = $this->client->headObject($input);
+                $nextAppendOffset = $output->getContentLength();
+            }
+            $input = new AppendObjectInput($this->bucket, $key);
+            $nextAppendOffset = $config->get('next_append_offset', 0);
+            $input->setOffset($nextAppendOffset);
+            // 设置对象 ACL
+            $input->setACL($config->get('acl', Enum::ACLPublicRead));
+            // 设置对象 StorageClass
+            $input->setStorageClass($config->get('storage_class', Enum::StorageClassStandard));
+            if(($meta = $config->get('meta')) && is_array($meta)){
+                // 设置对象自定义元数据
+                $input->setMeta($meta);
+            }
+            // 设置对象 Content-Type
+            $input->setContentType($config->get('content_type', 'text/plain'));
+            //设置内容
+            $input->setContent($content);
+            $output = $this->client->appendObject($input);
+            // 下一次追加上传的起始位置
+            $nextAppendOffset = $output->getNextAppendOffset();
+            return $nextAppendOffset;
+        } catch (\Exception $e) {
+            $this->handleException($e, $path);
+            throw new UnableToWriteFile($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * 分片上传
+     * @param string path
+     * @param string localBigFilePath
+     * @param Config config
+     * @return void
+     */
+    public function multipartWrite(string $path, string $localBigFilePath, Config $config)
+    {
+        if(!file_exists($localBigFilePath)){
+            throw new UnableToWriteFile('local big file not found');
+        }
+
+        $key = $this->applyPathPrefix($path);
+        // 步骤一：创建分片上传任务
+        $input = new CreateMultipartUploadInput($this->bucket, $key);
+        // 设置对象 ACL
+        $input->setACL($config->get('acl', Enum::ACLPublicRead));
+        // 设置对象 StorageClass
+        $input->setStorageClass($config->get('storage_class', Enum::StorageClassStandard));
+        if(($meta = $config->get('meta')) && is_array($meta)){
+            // 设置对象自定义元数据
+            $input->setMeta($meta);
+        }
+        // 设置对象 Content-Type
+        $input->setContentType($config->get('content_type', 'text/plain'));
+        $output = $this->client->createMultipartUpload($input);
+
+        // 获取 UploadID
+        $uploadId = $output->getUploadID();
+
+        // 步骤二：上传多个分片
+        // 假设按照 20MB 切分大文件
+        $partSize = $config->get('part_size', SELF::DEFAULT_PART_SIZE);
+        $fileSize = filesize($localBigFilePath);
+
+        $partCount = intval($fileSize / $partSize);
+        if (($lastPartSize = $fileSize % $partSize) !== 0) {
+            $partCount++;
+        } else {
+            $lastPartSize = $partSize;
+        }
+
+        $parts = [];
+        try{
+            for ($i = 0; $i < $partCount; $i++) {
+                $partNumber = $i + 1;
+                $file = fopen($localBigFilePath, 'r');
+                // 设置当前上传的文件起始位置
+                fseek($file, $partSize * $i, 0);
+                $input = new UploadPartInput($this->bucket, $key, $uploadId, $partNumber);
+                if ($i === $partCount - 1) {
+                    // 处理最后一个分片
+                    $input->setContentLength($lastPartSize);
+                } else {
+                    $input->setContentLength($partSize);
+                }
+                $input->setContent($file);
+                $output = $this->client->uploadPart($input);
+                if (is_resource($file)) {
+                    fclose($file);
+                }
+                // 收集所有分片
+                $parts[] = new UploadedPart($partNumber, $output->getETag());
+            }
+            // 步骤三：合并分片
+            $input = new CompleteMultipartUploadInput($this->bucket, $key, $uploadId, $parts);
+            $output = $this->client->completeMultipartUpload($input);
+        } finally {
+            if (is_resource($file)) {
+                fclose($file);
+            }
         }
     }
 
@@ -161,32 +364,30 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     public function deleteDirectory(string $path): void
     {
         $prefix = rtrim($this->applyPathPrefix($path), '/') . '/';
-        
         try {
             $objects = [];
             $nextMarker = '';
-            
+
             do {
                 $listInput = new ListObjectsInput($this->bucket);
                 $listInput->setPrefix($prefix);
                 $listInput->setMarker($nextMarker);
-                
+
                 $output = $this->client->listObjects($listInput);
-                
+
                 foreach ($output->getContents() as $object) {
                     $objects[] = ['Key' => $object->getKey()];
                 }
-                
+
                 $nextMarker = $output->getNextMarker();
             } while (!empty($nextMarker));
-            
+
             if (!empty($objects)) {
-                $this->client->deleteObjects([
-                    'Bucket' => $this->bucket,
-                    'Delete' => ['Objects' => $objects],
-                ]);
+                $input = new DeleteMultiObjectsInput($this->bucket, $objects);
+                $output = $this->client->deleteMultiObjects($input);
             }
-        } catch (\Exception $e) {
+        } catch (TosClientException|TosServerException $e) {
+            $this->handleException($e, $path);
             throw UnableToDeleteDirectory::atLocation($path, $e->getMessage(), $e);
         }
     }
@@ -197,39 +398,33 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     public function createDirectory(string $path, ?Config $config = null): void
     {
         $config = $config ?? new Config();
-        $location = rtrim($this->applyPathPrefix($path), '/') . '/';
+        $key = rtrim($this->applyPathPrefix($path), '/') . '/';
 
         try {
-            $this->client->putObject([
-                'Bucket' => $this->bucket,
-                'Key' => $location,
-                'Body' => '',
-                'ACL' => $this->client->getAclFromVisibility($config->get(Config::OPTION_VISIBILITY)),
-            ]);
+            $input = new PutObjectInput($this->bucket, $key);
+            $this->client->putObject($input);
         } catch (\Exception $e) {
-            throw UnableToCreateDirectory::atLocation($path, $e->getMessage(), $e);
+            throw UnableToCreateDirectory::atLocation($key, $e->getMessage(), $e);
         }
     }
 
     /**
      * {@inheritdoc}
      */
-    public function visibility(string $path): FileAttributes
+    public function visibility(string $path, string $versionId = ''): FileAttributes
     {
+        $key = $this->applyPathPrefix($path);
+        $input = new GetObjectACLInput($this->bucket, $key, $versionId);
         try {
-            $response = $this->client->getObjectAcl([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($path),
-            ]);
 
+            $output = $this->client->getObjectAcl($input);
             $visibility = Visibility::PRIVATE;
-            foreach ($response->getGrants() as $grant) {
-                if ($grant->getGrantee()->getURI() === 'http://acs.amazonaws.com/groups/global/AllUsers') {
+            foreach ($output->getGrants() as $grant) {
+                if ($grant->getGrantee()->getCanned() === 'AllUsers') {
                     $visibility = Visibility::PUBLIC;
                     break;
                 }
             }
-
             return new FileAttributes($path, null, $visibility);
         } catch (\Exception $e) {
             throw UnableToRetrieveMetadata::visibility($path, $e->getMessage(), $e);
@@ -239,15 +434,13 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     /**
      * {@inheritdoc}
      */
-    public function mimeType(string $path): FileAttributes
+    public function mimeType(string $path, string $versionId = ''): FileAttributes
     {
+        $key = $this->applyPathPrefix($path);
+        $input = new HeadObjectInput($this->bucket, $key, $versionId);
         try {
-            $response = $this->client->headObject([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($path),
-            ]);
-
-            return new FileAttributes($path, null, null, null, $response->getContentType());
+            $output = $this->client->headObject($input);
+            return new FileAttributes($path, null, null, null, $output->getContentType());
         } catch (\Exception $e) {
             throw UnableToRetrieveMetadata::mimeType($path, $e->getMessage(), $e);
         }
@@ -256,16 +449,13 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     /**
      * {@inheritdoc}
      */
-    public function lastModified(string $path): FileAttributes
+    public function lastModified(string $path, string $versionId = ''): FileAttributes
     {
+        $key = $this->applyPathPrefix($path);
+        $input = new HeadObjectInput($this->bucket, $key, $versionId);
         try {
-            $response = $this->client->headObject([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($path),
-            ]);
-
-            $timestamp = strtotime($response->getLastModified());
-            return new FileAttributes($path, null, null, $timestamp);
+            $output = $this->client->headObject($input);
+            return new FileAttributes($path, null, null, $output->getLastModified());
         } catch (\Exception $e) {
             throw UnableToRetrieveMetadata::lastModified($path, $e->getMessage(), $e);
         }
@@ -274,15 +464,13 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     /**
      * {@inheritdoc}
      */
-    public function fileSize(string $path): FileAttributes
+    public function fileSize(string $path, string $versionId = ''): FileAttributes
     {
+        $key = $this->applyPathPrefix($path);
+        $input = new HeadObjectInput($this->bucket, $key, $versionId);
         try {
-            $response = $this->client->headObject([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($path),
-            ]);
-
-            return new FileAttributes($path, $response->getContentLength());
+            $output = $this->client->headObject($input);
+            return new FileAttributes($path, $output->getContentLength());
         } catch (\Exception $e) {
             throw UnableToRetrieveMetadata::fileSize($path, $e->getMessage(), $e);
         }
@@ -291,65 +479,33 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     /**
      * {@inheritdoc}
      */
-    public function move(string $source, string $destination, Config $config = null): void
+    public function move(string $source, string $destination, ?Config $config = null, string $destinationBucket = ''): void
     {
         try {
+            $key = $this->applyPathPrefix($destination);
+            $srcKey = $this->applyPathPrefix($source);
+            $bucket = $destinationBucket ?: $this->bucket;
+            $input = new CopyObjectInput($bucket, $key, $this->bucket, $srcKey);
             // 复制到新路径
-            $this->client->copyObject([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($destination),
-                'CopySource' => "{$this->bucket}/{$this->applyPathPrefix($source)}",
-            ]);
-
+            $this->client->copyObject($input);
             // 删除原路径
-            $this->delete($source);
+            $this->delete($srcKey);
         } catch (\Exception $e) {
+            $this->handleException($e, $source);
             throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
         }
     }
 
     /**
-     * 处理TOS异常
-     */
-    protected function handleException(\Exception $e, string $path = ''): void
-    {
-        if ($e instanceof TosServerException) {
-            if ($e->getStatusCode() === 404) {
-                throw new UnableToReadFile($path, $e->getStatusCode(), $e);
-            }
-            if ($e->getStatusCode() === 403) {
-                throw new UnableToReadFile($path, $e->getStatusCode(), $e);
-            }
-        }
-        
-        throw new UnableToReadFile($e->getMessage(), 0, $e);
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function write(string $path, string $contents, Config $config): void
-    {
-        $config = $config ?: new Config();
-        $key = $this->applyPathPrefix($path);
-
-        try {
-            $response = $this->client->putObject([
-                'Bucket' => $this->bucket,
-                'Key' => $key,
-                'Body' => $contents,
-            ]);
-        } catch (\Exception $e) {
-            $this->handleException($e, $path);
-        }
-    }
-
-    /**
-     * {@inheritdoc}
+     * 文件流写入
+     * @param string path
+     * @param resource resource
+     * @param Config config
+     * @return void
+     * @throws UnableToWriteFile
      */
     public function writeStream(string $path, $resource, Config $config): void
     {
-        $config = $config ?: new Config();
         $key = $this->applyPathPrefix($path);
         try {
             $input = new PutObjectInput($this->bucket, $key);
@@ -357,14 +513,14 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
                 $input->setMeta($meta);
             }
             $input->setContent($resource);
-            $response = $this->client->putObject($input);
-
+            $this->client->putObject($input);
+        } catch (\Exception $e) {
+            $this->handleException($e, $path);
+            throw new UnableToWriteFile($e->getMessage(), $e->getCode(), $e);
+        }finally{
             if (is_resource($resource)) {
                 fclose($resource);
             }
-        } catch (\Exception $e) {
-            halt($e);
-            $this->handleException($e, $path);
         }
     }
 
@@ -448,24 +604,24 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
             // 列出所有对象
             $objects = [];
             $continuationToken = '';
-            
+
             do {
                 $params = [
                     'Bucket' => $this->bucket,
                     'Prefix' => $prefix,
                     'ContinuationToken' => $continuationToken,
                 ];
-                
+
                 /** @var ListObjectsV2Output $result */
                 $result = $this->client->listObjectsV2($params);
-                
+
                 foreach ($result->getContents() as $object) {
                     $objects[] = ['Key' => $object->getKey()];
                 }
-                
+
                 $continuationToken = $result->getContinuationToken();
             } while ($result->isTruncated());
-            
+
             // 批量删除
             if (!empty($objects)) {
                 $this->client->deleteObjects([
@@ -473,7 +629,7 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
                     'Delete' => ['Objects' => $objects],
                 ]);
             }
-            
+
             return true;
         } catch (\Exception $e) {
             $this->handleException($e, $dirname);
@@ -482,35 +638,12 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     }
 
     /**
-     * {@inheritdoc}
-     */
-    public function createDir($dirname, ?Config $config = null)
-    {
-        $config = $config ?: new Config();
-        $path = rtrim($dirname, '/') . '/';
-        $location = $this->applyPathPrefix($path);
-
-        try {
-            // 上传空对象模拟目录
-            $this->client->putObject([
-                'Bucket' => $this->bucket,
-                'Key' => $location,
-                'Body' => '',
-            ]);
-
-            return [
-                'path' => $path,
-                'type' => 'dir',
-            ];
-        } catch (\Exception $e) {
-            $this->handleException($e, $dirname);
-            return false;
-        }
-    }
-
-
-    /**
-     * {@inheritdoc}
+     * 读取文件(普通下载)
+     * @param string path
+     * @param string range
+     * @param string versionId
+     * @return \Tos\Helper\StreamReader
+     * @throws UnableToReadFile
      */
     public function read(string $path, string $range = '', string $versionId = ''): string
     {
@@ -520,29 +653,29 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
             $output = $this->client->getObject($input);
             return $output->getContent()->getContents();
         } catch (\Exception $e) {
+            $this->handleException($e, $path);
             throw new UnableToReadFile($e->getMessage(), $e->getCode(), $e);
         }
     }
 
     /**
-     * {@inheritdoc}
+     * 读取文件流
+     * @param string path
+     * @param string range
+     * @param string versionId
+     * @return \Tos\Helper\StreamReader
+     * @throws UnableToReadFile
      */
-    public function readStream($path)
+    public function readStream(string $path, string $range = '', string $versionId = '')
     {
+        $key = $this->applyPathPrefix($path);
+        $input = new GetObjectInput($this->bucket, $key, $range, $versionId);
         try {
-            $response = $this->client->getObject([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($path),
-            ]);
-
-            return [
-                'path' => $path,
-                'stream' => $response->getBody()->detach(),
-                'type' => 'file',
-            ];
+            $output = $this->client->getObject($input);
+            return $output->getContent();
         } catch (\Exception $e) {
             $this->handleException($e, $path);
-            return false;
+            throw new UnableToReadFile($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -554,7 +687,7 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
         $result = [];
         $nextMarker = '';
         $basePrefix = $this->applyPathPrefix($path);
-        
+
         if (!$deep && $basePrefix !== '' && !str_ends_with($basePrefix, '/')) {
             $basePrefix .= '/';
         }
@@ -589,12 +722,12 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
                     }
 
                     $relativePath = $this->removePathPrefix($fullObjectKey);
-                    
+
                     $result[] = new FileAttributes(
                         $relativePath,
                         $content->getSize(),
                         null,
-                        strtotime($content->getLastModified()),
+                        $content->getLastModified(),
                         null,
                         [$content->getETag()]
                     );
@@ -624,7 +757,7 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
                 'path' => $path,
                 'type' => 'file',
                 'size' => $response->getContentLength(),
-                'timestamp' => strtotime($response->getLastModified()),
+                'timestamp' => $response->getLastModified(),
                 'etag' => $response->getETag(),
             ];
         } catch (\Exception $e) {
@@ -675,38 +808,9 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
     /**
      * {@inheritdoc}
      */
-    public function getVisibility($path)
-    {
-        try {
-            $response = $this->client->getObjectAcl([
-                'Bucket' => $this->bucket,
-                'Key' => $this->applyPathPrefix($path),
-            ]);
-
-            $visibility = 'private';
-            foreach ($response->getGrants() as $grant) {
-                if ($grant->getGrantee()->getURI() === 'http://acs.amazonaws.com/groups/global/AllUsers') {
-                    $visibility = 'public';
-                    break;
-                }
-            }
-
-            return [
-                'path' => $path,
-                'visibility' => $visibility,
-            ];
-        } catch (\Exception $e) {
-            $this->handleException($e, $path);
-            return false;
-        }
-    }
-
-    /**
-     * {@inheritdoc}
-     */
     public function setVisibility(string $path, string $visibility, string $versionId = ''): void
     {
-        $acl = $visibility === 'public' ? 'public-read' : 'private';
+        $acl = $visibility === 'public' ? Enum::ACLPublicRead : Enum::ACLPrivate;
         $key = $this->applyPathPrefix($path);
         try {
             $input = new PutObjectACLInput($this->bucket, $key, $acl, $versionId);
@@ -744,16 +848,13 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
             }
             return $url;
         }
-        
         // 预签名URL
         if ($expires > 0) {
             return $this->getPresignedUrl($path, 'GET', $expires);
         }
-        
         // 标准URL
         $protocol = $this->config['protocol'] ? (strpos($this->config['endpoint'], 'https') === 0 ? 'https' : 'http') : 'https';
         $domain = $this->config['domain'] ?: "{$this->bucket}.tos-{$this->config['region']}.volces.com";
-        
         return "{$protocol}://{$domain}/" . ltrim($key, '/');
     }
 
@@ -770,7 +871,6 @@ class VeTosAdapter implements FilesystemAdapter, PublicUrlGenerator
         $input->setHttpMethod($method);
         $input->setKey($this->applyPathPrefix($path));
         $input->setExpires($expires);
-        
         $response = $this->client->preSignedURL($input);
         return $response->getSignedUrl();
     }

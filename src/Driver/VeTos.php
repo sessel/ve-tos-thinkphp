@@ -10,6 +10,7 @@ use League\Flysystem\Config;
 use think\filesystem\Driver;
 use Sessel\VeTosThinkphp\Adapter\VeTosAdapter;
 use think\File;
+use Tos\Exception\TosClientException;
 
 class VeTos extends Driver
 {
@@ -20,21 +21,26 @@ class VeTos extends Driver
     protected $config = [
         'ak' => '',
         'sk' => '',
-        'region' => 'cn-beijing',
+        'region' => '',
         'bucket' => '',
         'prefix' => '',
         'domain' => '',
-        'protocol' => 'https',
         'endpoint' => '',
         'connection_timeout' => 3000,
         'socket_timeout' => 3000,
         'max_retries' => 3,
+        'error_handler' => null,
     ];
 
     public function __construct(array $config)
     {
-        $this->config = array_merge($this->config, $config);
+        //禁用volcengine/ve-tos-php-sdk代码导致的E_DEPRECATED错误
+        error_reporting(error_reporting() & ~E_DEPRECATED);
 
+        $this->config = array_merge($this->config, $config);
+        if(empty($this->config['ak']) || empty($this->config['sk']) || empty($this->config['region']) || empty($this->config['bucket'])){
+            throw new TosClientException('missing config');
+        }
         $adapter = $this->createAdapter();
         $this->filesystem = $this->createFilesystem($adapter);
     }
