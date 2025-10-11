@@ -97,7 +97,7 @@ class VeTos extends Driver
         if (is_resource($stream)) {
             fclose($stream);
         }
-        return $result['path'] ?? false;
+        return $result['path'] ?? $path;
     }
 
     /**
