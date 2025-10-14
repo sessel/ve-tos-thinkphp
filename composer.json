@@ -13,7 +13,8 @@
     },
     "autoload": {
         "psr-4": {
-            "Sessel\\VeTosThinkphp\\": "src/"
+            "Sessel\\VeTosThinkphp\\": "src/",
+            "think\\filesystem\\driver\\": "src/Driver/"
         }
     },
     "autoload-dev": {

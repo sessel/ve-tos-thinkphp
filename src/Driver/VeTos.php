@@ -1,12 +1,10 @@
 <?php
 
-namespace Sessel\VeTosThinkphp\Driver;
+namespace think\filesystem\driver;
 
 use DateTime;
 use InvalidArgumentException;
-use League\Flysystem\Filesystem;
 use League\Flysystem\FilesystemAdapter;
-use League\Flysystem\Config;
 use think\filesystem\Driver;
 use Sessel\VeTosThinkphp\Adapter\VeTosAdapter;
 use think\File;
@@ -43,16 +41,6 @@ class VeTos extends Driver
         }
         $adapter = $this->createAdapter();
         $this->filesystem = $this->createFilesystem($adapter);
-    }
-
-    /**
-     * 创建文件系统
-     * @return Filesystem
-     */
-    protected function createFilesystem(FilesystemAdapter $adapter): Filesystem
-    {
-        // 返回Filesystem实例
-        return new Filesystem($adapter, $this->config);
     }
 
     /**
